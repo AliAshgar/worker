@@ -7,10 +7,6 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-curl -s https://file.winsnip.xyz/file/uploads/Logo-winsip.sh | bash
-echo "Starting Auto Install Nodes And Relayer for BrinxAI"
-sleep 5
-
 log() {
     local level=$1
     local message=$2
@@ -19,51 +15,42 @@ log() {
     
     echo -e "${border}"
     case $level in
-        "INFO")
-            echo -e "${CYAN}[INFO] ${timestamp} - ${message}${NC}"
-            ;;
-        "SUCCESS")
-            echo -e "${GREEN}[SUCCESS] ${timestamp} - ${message}${NC}"
-            ;;
-        "ERROR")
-            echo -e "${RED}[ERROR] ${timestamp} - ${message}${NC}"
-            ;;
-        *)
-            echo -e "${YELLOW}[UNKNOWN] ${timestamp} - ${message}${NC}"
-            ;;
+        "INFO") echo -e "${CYAN}[INFO] ${timestamp} - ${message}${NC}" ;;
+        "SUCCESS") echo -e "${GREEN}[SUCCESS] ${timestamp} - ${message}${NC}" ;;
+        "ERROR") echo -e "${RED}[ERROR] ${timestamp} - ${message}${NC}" ;;
+        *) echo -e "${YELLOW}[UNKNOWN] ${timestamp} - ${message}${NC}" ;;
     esac
     echo -e "${border}\n"
 }
 
-common() {
-    local duration=$1
-    local message=$2
-    local end=$((SECONDS + duration))
-    local spinner="⣷⣯⣟⡿⣿⡿⣟⣯⣷"
-    
-    echo -n -e "${YELLOW}${message}...${NC} "
-    while [ $SECONDS -lt $end ]; do
-        printf "\b${spinner:((SECONDS % ${#spinner}))%${#spinner}:1}"
-        sleep 0.1
+check_requirements() {
+    for cmd in curl git lsof docker; do
+        if ! command -v $cmd &> /dev/null; then
+            log "ERROR" "$cmd is not installed. Please install it and rerun the script."
+            exit 1
+        fi
     done
-    printf "\r${GREEN}Done!${NC} \n"
+}
+
+create_network_if_missing() {
+    if ! sudo docker network ls | grep -q "brinxai-network"; then
+        log "INFO" "Creating Docker network brinxai-network..."
+        sudo docker network create brinxai-network
+    fi
 }
 
 cleanup_containers() {
     local pattern="admier/brinxai_nodes"
     log "INFO" "Searching for containers with pattern: ${pattern}"
-    containers=$(docker ps --format "{{.ID}} {{.Image}} {{.Names}}" | grep "${pattern}")
+    containers=$(docker ps -a --format "{{.ID}} {{.Image}} {{.Names}}" | grep "${pattern}" || true)
 
     if [ -z "$containers" ]; then
         log "INFO" "No matching containers found. Skipping container cleanup."
-        return
     else
-        log "INFO" "Containers found:"
         echo "$containers"
         container_ids=$(echo "$containers" | awk '{print $1}')
-        log "INFO" "Container IDs found:"
-        echo "$container_ids"
         docker stop $container_ids && docker rm $container_ids
+        log "SUCCESS" "Old containers stopped and removed."
     fi
 }
 
@@ -74,28 +61,28 @@ setup_firewall() {
     sudo ufw allow 5011/tcp
     sudo ufw --force enable
     sudo ufw status
+    log "SUCCESS" "Firewall configured."
 }
 
 install_docker() {
     if ! command -v docker &> /dev/null; then
-        log "INFO" "Installing Docker and pulling BrinxAI images..."
+        log "INFO" "Installing Docker..."
         sudo apt-get update
         sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
         echo "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list
         sudo apt-get update
         sudo apt-get install -y docker-ce
-        sudo docker pull admier/brinxai_nodes-worker:latest
-    else
-        log "INFO" "Docker is already installed. Skipping Docker installation."
     fi
+    sudo docker pull admier/brinxai_nodes-worker:latest
 }
 
 check_gpu() {
-    if lspci | grep -i nvidia; then
+    if lspci | grep -i nvidia > /dev/null; then
         log "INFO" "NVIDIA GPU detected. Installing NVIDIA Container Toolkit..."
         wget https://raw.githubusercontent.com/NVIDIA/nvidia-docker/main/scripts/nvidia-docker-install.sh
         sudo bash nvidia-docker-install.sh
+        rm -f nvidia-docker-install.sh
     else
         log "INFO" "No NVIDIA GPU detected. Skipping NVIDIA installation."
     fi
@@ -103,17 +90,13 @@ check_gpu() {
 
 check_port() {
     local port=$1
-    if sudo lsof -i -P -n | grep ":$port" > /dev/null; then
-        return 1
-    else
-        return 0
-    fi
+    ! sudo lsof -i -P -n | grep ":$port" > /dev/null
 }
 
 find_available_port() {
     local port=$1
     while ! check_port "$port"; do
-        port=$((port+1))
+        port=$((port + 1))
     done
     echo "$port"
 }
@@ -122,76 +105,61 @@ clone_repository() {
     if [ ! -d "BrinxAI-Worker-Nodes" ]; then
         log "INFO" "Cloning BrinxAI Worker Nodes repository..."
         git clone https://github.com/admier1/BrinxAI-Worker-Nodes
-    else
-        log "INFO" "BrinxAI Worker Nodes repository is already cloned."
     fi
-
     cd BrinxAI-Worker-Nodes || exit
-    log "INFO" "Running installation script..."
     chmod +x install_ubuntu.sh
     ./install_ubuntu.sh
-    log "INFO" "Pulling the latest Docker image for BrinxAI Worker..."
     sudo docker pull admier/brinxai_nodes-worker:latest
+    cd ..
 }
 
 run_additional_containers() {
-    log "INFO" "Running additional Docker containers..."
-
-    local text_ui_port=$(find_available_port 5000)
-    local stable_diffusion_port=$(find_available_port 5050)
+    log "INFO" "Starting additional containers..."
     local rembg_port=$(find_available_port 7000)
     local upscaler_port=$(find_available_port 3000)
 
-    cleanup_container() {
-        local container_name=$1
-        if sudo docker ps -q -f name="$container_name" | grep -q .; then
-            log "INFO" "Stopping and removing container $container_name..."
-            sudo docker stop "$container_name" && sudo docker rm "$container_name"
-        elif sudo docker ps -aq -f name="$container_name" | grep -q .; then
-            log "INFO" "Removing stopped container $container_name..."
-            sudo docker rm "$container_name"
+    for name in rembg upscaler; do
+        if docker ps -aq -f name="$name" > /dev/null; then
+            log "INFO" "Removing existing container: $name"
+            docker rm -f "$name"
         fi
-    }
+    done
 
-    cleanup_container "text-ui"
-    cleanup_container "rembg"
-    cleanup_container "upscaler"
-
-    log "INFO" "Running new containers..."
-
-    #sudo docker run -d --name text-ui --network brinxai-network --cpus=4 --memory=4096m -p 127.0.0.1:"$text_ui_port":5000 admier/brinxai_nodes-text-ui:latest
-    sudo docker run -d --name rembg --network brinxai-network --cpus=2 --memory=2048m -p 127.0.0.1:"$rembg_port":7000 admier/brinxai_nodes-rembg:latest
-    sudo docker run -d --name upscaler --network brinxai-network --cpus=2 --memory=2048m -p 127.0.0.1:"$upscaler_port":3000 admier/brinxai_nodes-upscaler:latest
+    docker run -d --name rembg --network brinxai-network --cpus=2 --memory=2048m -p 127.0.0.1:"$rembg_port":7000 admier/brinxai_nodes-rembg:latest
+    docker run -d --name upscaler --network brinxai-network --cpus=2 --memory=2048m -p 127.0.0.1:"$upscaler_port":3000 admier/brinxai_nodes-upscaler:latest
 }
 
 run_brinxai_relay() {
-    log "INFO" "Running BrinxAI Relay..."
+    log "INFO" "Starting BrinxAI Relay..."
+    sudo ufw allow 1194/udp
+    sudo ufw reload
 
-    command -v ufw &> /dev/null && sudo ufw allow 1194/udp && sudo ufw reload
-    command -v firewall-cmd &> /dev/null && sudo firewall-cmd --permanent --add-port=1194/udp && sudo firewall-cmd --reload
-
-    if sudo docker ps -q -f name=brinxai_relay; then
-        sudo docker stop brinxai_relay && sudo docker rm brinxai_relay
+    if docker ps -q -f name=brinxai_relay; then
+        docker rm -f brinxai_relay
     fi
 
     arch=$(uname -m)
-    if [ "$arch" == "x86_64" ]; then
-        sudo docker run -d --name brinxai_relay --cap-add=NET_ADMIN -p 1194:1194/udp admier/brinxai_nodes-relay:latest
-    elif [ "$arch" == "aarch64" ] || [ "$arch" == "arm64" ]; then
-        sudo docker run -d --name brinxai_relay --cap-add=NET_ADMIN -p 1194:1194/udp admier/brinxai_nodes-relay:arm64
-    fi
+    image="admier/brinxai_nodes-relay:latest"
+    [ "$arch" == "aarch64" ] || [ "$arch" == "arm64" ] && image="admier/brinxai_nodes-relay:arm64"
+
+    docker run -d --name brinxai_relay --cap-add=NET_ADMIN -p 1194:1194/udp "$image"
 }
 
 main() {
-    cleanup_containers || log "WARNING" "Container cleanup failed. Proceeding to next step."
+    curl -s https://file.winsnip.xyz/file/uploads/Logo-winsip.sh | bash
+    echo "Starting Auto Install Nodes And Relayer for BrinxAI"
+    sleep 3
+    check_requirements
+    create_network_if_missing
+    cleanup_containers
     setup_firewall
     install_docker
     check_gpu
     clone_repository
     run_additional_containers
     run_brinxai_relay
-    log "INFO" "Input node IP for login: https://workers.brinxai.com"
-    log "INFO" "Check logs: docker logs brinxai-worker-nodes-worker-1"
+    log "SUCCESS" "Installation complete. Access at: https://workers.brinxai.com"
+    log "INFO" "To check logs: docker logs brinxai-worker-nodes-worker-1"
 }
 
 main
